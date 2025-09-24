@@ -85,6 +85,89 @@ class Program{
         public long GameObjectId;
     }
 
+    static void DumpSceneHierarchy(
+        string outputPath,
+        string outFileName,
+        Dictionary<long, GameObjectInfo> gameObjects,
+        Dictionary<long, TransformInfo> transforms) {
+        var filePath = Path.Combine(outputPath, outFileName);
+        using var writer = new StreamWriter(filePath);
+
+        // Map TransformId → GameObject
+        var transformIdToGO = new Dictionary<long, GameObjectInfo>();
+        foreach (var t in transforms.Values) {
+            if (gameObjects.TryGetValue(t.GameObjectId, out var go))
+                transformIdToGO[t.TransformId] = go;
+        }
+
+        // Find root Transforms (no parent)
+        var rootTransforms = new List<TransformInfo>();
+        foreach (var t in transforms.Values) {
+            if (t.FatherId == 0)
+                rootTransforms.Add(t);
+        }
+
+        void PrintTransform(TransformInfo t, string indent) {
+            if (!transformIdToGO.TryGetValue(t.TransformId, out var go)) return;
+
+            // Print GameObject name only
+            writer.WriteLine($"{indent}{go.Name}");
+
+            // Print children recursively
+            foreach (var childId in t.ChildrenIds) {
+                if (transforms.TryGetValue(childId, out var childTransform)) {
+                    PrintTransform(childTransform, indent + "--");
+                }
+            }
+        }
+
+        // Print all root transforms
+        foreach (var root in rootTransforms) {
+            PrintTransform(root, "");
+        }
+    }
+
+    static void DumpUnusedScripts(
+        string outputFolder,
+        string outFileName,
+        string projectPath,
+        Dictionary<string, string> guidToCs,
+        List<MonoBehaviourInfo> monoBehaviours) {
+        // Collect all GUIDs that appear in MonoBehaviours
+        var usedGuids = new HashSet<string>(
+                monoBehaviours
+                    .Where(mb => !string.IsNullOrEmpty(mb.ScriptGuid))
+                    .Select(mb => mb.ScriptGuid),
+                StringComparer.OrdinalIgnoreCase
+            );
+
+        // Prepare CSV lines (with header)
+        var lines = new List<string> { "Relevant Path, GUID" };
+
+        // Find scripts not referenced in any scene
+        foreach (var kvp in guidToCs) {
+            if (!usedGuids.Contains(kvp.Key)) {
+                // Make path relative to project folder
+                var relativePath = kvp.Value.StartsWith(projectPath, StringComparison.OrdinalIgnoreCase)
+                    ? kvp.Value.Substring(projectPath.Length)
+                    : kvp.Value;
+
+                // Escape if contains comma
+                if (relativePath.Contains(","))
+                    relativePath = $"\"{relativePath}\"";
+
+                lines.Add($"{relativePath},{kvp.Key}");
+            }
+        }
+
+        // Save to CSV file
+        var unusedFilePath = Path.Combine(outputFolder, outFileName);
+        File.WriteAllLines(unusedFilePath, lines);
+
+        Console.WriteLine($"Unused scripts written: {lines.Count - 1}");
+    }
+
+
     static int Main(string[] args) {
         if (args.Length != 2) {
             Console.WriteLine("Usage: tool.exe <unity_project_path> <output_folder_path>");
@@ -104,9 +187,6 @@ class Program{
         var csFiles = Directory.EnumerateFiles(projectPath, "*.cs", SearchOption.AllDirectories);
         var sceneFiles = Directory.EnumerateFiles(projectPath, "*.unity", SearchOption.AllDirectories);
 
-        Console.WriteLine($"Found {csFiles.Count()} .cs files");
-        Console.WriteLine($"Found {sceneFiles.Count()} .unity scene files");
-
         var guidToCs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var csPath in csFiles) {
@@ -116,18 +196,16 @@ class Program{
             }
         }
 
-        foreach (var key in guidToCs.Keys) {
-            Console.WriteLine($"Guid {key} related to file: {guidToCs[key]}");
-        }
+        var monoBehaviours = new List<MonoBehaviourInfo>();
 
         foreach (var scenePath in sceneFiles) {
-            Console.WriteLine($"Parsing scene: {scenePath}");
+            var outFileName = Path.GetFileName(scenePath) + ".dump";
+            
             var text = File.ReadAllText(scenePath);
             var blocks = SplitUnityYamlBlocks(text);
 
             var gameObjects = new Dictionary<long, GameObjectInfo>();
             var transforms = new Dictionary<long, TransformInfo>();
-            var monoBehaviours = new List<MonoBehaviourInfo>();
 
             foreach (var block in blocks) {
                 if (block.ClassId == 1) // GameObject
@@ -147,7 +225,7 @@ class Program{
                     var transformId = block.FileId;
                     var fatherId = ExtractTransformFather(block.RawText) ?? 0;
                     var goId = ExtractGameObjectFileId(block.RawText) ?? 0;
-                    
+
                     var childrenIds = new List<long>();
 
                     // Parse m_Children array: each child has fileID
@@ -181,21 +259,11 @@ class Program{
                     father.ChildrenIds.Add(t.TransformId);
             }
 
-            Console.WriteLine(
-                $"Scene parsed: {gameObjects.Count} GameObjects, {transforms.Count} Transforms, {monoBehaviours.Count} MonoBehaviours");
+            DumpSceneHierarchy(outputPath, outFileName, gameObjects, transforms);
         }
 
+        DumpUnusedScripts(outputPath, "UnusedScripts.csv", projectPath, guidToCs, monoBehaviours);
 
-        // foreach (var go in gameObjects.Values) {
-        //     if (go.TransformId.HasValue)
-        //         transformToGameObject[go.TransformId.Value] = go.FileId;
-        // }
-        //
-        // foreach (var comp in componentMap.Values) {
-        //     if (comp.GameObjectId.HasValue && gameObjects.TryGetValue(comp.GameObjectId.Value, out var go)) {
-        //         go.ComponentFileIds.Add(comp.FileId);
-        //     }
-        // }
         return 0;
     }
 }
