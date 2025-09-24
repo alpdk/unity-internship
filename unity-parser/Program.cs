@@ -163,8 +163,6 @@ class Program{
         // Save to CSV file
         var unusedFilePath = Path.Combine(outputFolder, outFileName);
         File.WriteAllLines(unusedFilePath, lines);
-
-        Console.WriteLine($"Unused scripts written: {lines.Count - 1}");
     }
 
 
