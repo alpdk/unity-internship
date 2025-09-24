@@ -4,6 +4,105 @@ using System.Text.RegularExpressions;
 using System.Collections.Generic;
 
 class Program{
+    static int Main(string[] args) {
+        if (args.Length != 2) {
+            Console.WriteLine("Usage: tool.exe <unity_project_path> <output_folder_path>");
+            return 1;
+        }
+
+        var projectPath = args[0];
+        var outputPath = args[1];
+
+        if (!Directory.Exists(projectPath)) {
+            Console.WriteLine($"Project path does not exist: {projectPath}");
+            return 2;
+        }
+
+        Directory.CreateDirectory(outputPath);
+
+        var csFiles = Directory.EnumerateFiles(projectPath, "*.cs", SearchOption.AllDirectories);
+        var sceneFiles = Directory.EnumerateFiles(projectPath, "*.unity", SearchOption.AllDirectories);
+
+        var guidToCs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var csPath in csFiles) {
+            var guid = GetCsFileGuid(csPath);
+            if (guid != null) {
+                guidToCs[guid] = csPath;
+            }
+        }
+
+        var monoBehaviours = new List<MonoBehaviourInfo>();
+
+        foreach (var scenePath in sceneFiles) {
+            var outFileName = Path.GetFileName(scenePath) + ".dump";
+            
+            var text = File.ReadAllText(scenePath);
+            var blocks = SplitUnityYamlBlocks(text);
+
+            var gameObjects = new Dictionary<long, GameObjectInfo>();
+            var transforms = new Dictionary<long, TransformInfo>();
+
+            foreach (var block in blocks) {
+                if (block.ClassId == 1) // GameObject
+                {
+                    var name = ExtractSingle(block.RawText, "m_Name") ?? "<no-name>";
+                    var go = new GameObjectInfo { FileId = block.FileId, Name = name };
+
+                    // Collect all component FileIDs from m_Component array
+                    var compMatches = Regex.Matches(block.RawText, @"- component:\s*\{\s*fileID:\s*(-?\d+)\s*\}");
+                    foreach (Match match in compMatches)
+                        go.ComponentFileIds.Add(long.Parse(match.Groups[1].Value));
+
+                    gameObjects[block.FileId] = go;
+                }
+                else if (block.ClassId == 4) // Transform
+                {
+                    var transformId = block.FileId;
+                    var fatherId = ExtractTransformFather(block.RawText) ?? 0;
+                    var goId = ExtractGameObjectFileId(block.RawText) ?? 0;
+
+                    var childrenIds = new List<long>();
+
+                    // Parse m_Children array: each child has fileID
+                    var childMatches = Regex.Matches(block.RawText, @"- fileID:\s*(-?\d+)");
+                    foreach (Match match in childMatches) {
+                        childrenIds.Add(long.Parse(match.Groups[1].Value));
+                    }
+
+                    transforms[transformId] = new TransformInfo {
+                        TransformId = transformId,
+                        FatherId = fatherId,
+                        GameObjectId = goId,
+                        ChildrenIds = childrenIds
+                    };
+                }
+                else if (block.ClassId == 114) // MonoBehaviour
+                {
+                    var guid = ExtractScriptGuidFromBlock(block.RawText);
+                    var goId = ExtractGameObjectFileId(block.RawText) ?? 0;
+
+                    monoBehaviours.Add(new MonoBehaviourInfo {
+                        ScriptGuid = guid,
+                        GameObjectId = goId
+                    });
+                }
+            }
+
+            // Build Transform children relationships
+            foreach (var t in transforms.Values) {
+                if (t.FatherId != 0 && transforms.TryGetValue(t.FatherId, out var father))
+                    father.ChildrenIds.Add(t.TransformId);
+            }
+
+            DumpSceneHierarchy(outputPath, outFileName, gameObjects, transforms);
+        }
+
+        DumpUnusedScripts(outputPath, "UnusedScripts.csv", projectPath, guidToCs, monoBehaviours);
+
+        return 0;
+    }
+    
     static string GetCsFileGuid(string csFilePath) {
         var metaPath = csFilePath + ".meta";
 
@@ -163,105 +262,5 @@ class Program{
         // Save to CSV file
         var unusedFilePath = Path.Combine(outputFolder, outFileName);
         File.WriteAllLines(unusedFilePath, lines);
-    }
-
-
-    static int Main(string[] args) {
-        if (args.Length != 2) {
-            Console.WriteLine("Usage: tool.exe <unity_project_path> <output_folder_path>");
-            return 1;
-        }
-
-        var projectPath = args[0];
-        var outputPath = args[1];
-
-        if (!Directory.Exists(projectPath)) {
-            Console.WriteLine($"Project path does not exist: {projectPath}");
-            return 2;
-        }
-
-        Directory.CreateDirectory(outputPath);
-
-        var csFiles = Directory.EnumerateFiles(projectPath, "*.cs", SearchOption.AllDirectories);
-        var sceneFiles = Directory.EnumerateFiles(projectPath, "*.unity", SearchOption.AllDirectories);
-
-        var guidToCs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var csPath in csFiles) {
-            var guid = GetCsFileGuid(csPath);
-            if (guid != null) {
-                guidToCs[guid] = csPath;
-            }
-        }
-
-        var monoBehaviours = new List<MonoBehaviourInfo>();
-
-        foreach (var scenePath in sceneFiles) {
-            var outFileName = Path.GetFileName(scenePath) + ".dump";
-            
-            var text = File.ReadAllText(scenePath);
-            var blocks = SplitUnityYamlBlocks(text);
-
-            var gameObjects = new Dictionary<long, GameObjectInfo>();
-            var transforms = new Dictionary<long, TransformInfo>();
-
-            foreach (var block in blocks) {
-                if (block.ClassId == 1) // GameObject
-                {
-                    var name = ExtractSingle(block.RawText, "m_Name") ?? "<no-name>";
-                    var go = new GameObjectInfo { FileId = block.FileId, Name = name };
-
-                    // Collect all component FileIDs from m_Component array
-                    var compMatches = Regex.Matches(block.RawText, @"- component:\s*\{\s*fileID:\s*(-?\d+)\s*\}");
-                    foreach (Match match in compMatches)
-                        go.ComponentFileIds.Add(long.Parse(match.Groups[1].Value));
-
-                    gameObjects[block.FileId] = go;
-                }
-                else if (block.ClassId == 4) // Transform
-                {
-                    var transformId = block.FileId;
-                    var fatherId = ExtractTransformFather(block.RawText) ?? 0;
-                    var goId = ExtractGameObjectFileId(block.RawText) ?? 0;
-
-                    var childrenIds = new List<long>();
-
-                    // Parse m_Children array: each child has fileID
-                    var childMatches = Regex.Matches(block.RawText, @"- fileID:\s*(-?\d+)");
-                    foreach (Match match in childMatches) {
-                        childrenIds.Add(long.Parse(match.Groups[1].Value));
-                    }
-
-                    transforms[transformId] = new TransformInfo {
-                        TransformId = transformId,
-                        FatherId = fatherId,
-                        GameObjectId = goId,
-                        ChildrenIds = childrenIds
-                    };
-                }
-                else if (block.ClassId == 114) // MonoBehaviour
-                {
-                    var guid = ExtractScriptGuidFromBlock(block.RawText);
-                    var goId = ExtractGameObjectFileId(block.RawText) ?? 0;
-
-                    monoBehaviours.Add(new MonoBehaviourInfo {
-                        ScriptGuid = guid,
-                        GameObjectId = goId
-                    });
-                }
-            }
-
-            // Build Transform children relationships
-            foreach (var t in transforms.Values) {
-                if (t.FatherId != 0 && transforms.TryGetValue(t.FatherId, out var father))
-                    father.ChildrenIds.Add(t.TransformId);
-            }
-
-            DumpSceneHierarchy(outputPath, outFileName, gameObjects, transforms);
-        }
-
-        DumpUnusedScripts(outputPath, "UnusedScripts.csv", projectPath, guidToCs, monoBehaviours);
-
-        return 0;
     }
 }
